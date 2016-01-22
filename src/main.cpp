@@ -124,42 +124,91 @@ training(const fs::path& dataset_path, const fs::path& model_path)
 
 
 /*
+ * mean-shift for estimating weighted mean
+ * param[in]: set of prediction votes and initial estimation
+ *
+ */
+void
+meanshift(const std::vector<cv::Vec3f>& votes, cv::Vec3f& mean_vote)
+{
+    // const float bandwidth = pow(0.2, 2.f);
+    const float bandwidth = 0.08;
+    const int max_ms_iter = 10;
+
+    for (int iter = 0; iter < max_ms_iter; ++iter)
+    {
+        cv::Vec3f temp_mean = 0;
+        float sum_weight = 0.f;
+
+        // compute weighted mean
+        for (int k = 0; k < votes.size(); ++k)
+        {
+            // compute gaussian kernel
+            float norm = (float)cv::norm(mean_vote, votes[k]);
+            float weight = 1.0 / exp(pow(norm, 2.0) / (2.0 * bandwidth));
+            sum_weight += weight;
+
+            // weighted mean
+            temp_mean += weight * votes[k];
+        }
+
+        // normalize weighted mean
+        temp_mean /= (float)MAX(1, sum_weight);
+
+        // compute distance to previous mean
+        float distance_to_previous_mean = (float)cv::norm(temp_mean, mean_vote);
+
+        // update mean
+        mean_vote = temp_mean;
+
+        // check converge to stop
+        if (distance_to_previous_mean < 0.05)
+            break;
+    }
+}
+
+
+/*
  * program testing
  * param[in]: dataset path and model path
  *
  */
 void
-testing(const fs::path& dataset_path, const fs::path& model_path, const int& num_trees)
+testing(const fs::path& dataset_path, const fs::path& model_path)
 {
-    // const float bandwidth = pow(0.2, 2.f);
-    const float bandwidth = 0.2;
-    const int max_ms_iter = 10;
-
     // load train dataset
     std::vector<rf::sample> data;
     load_dataset(dataset_path, data);
 
+    std::vector<fs::path> tree_paths;
+    fs::directory_iterator end_itr;
+
+    // get number of trees in the directory
+    for (fs::directory_iterator i(model_path); i != end_itr; ++i)
+    {
+        // get filename of tree model file
+        if (fs::is_regular_file(i->status()) && i->path().extension() == ".yml")
+        {
+            tree_paths.push_back(i->path());
+        }
+    }
+
     // init forest
-    std::vector<rf::tree> forest(num_trees);
-    char tree_index[128];
+    std::vector<rf::tree> forest(tree_paths.size());
 
     // load trees
-    for (int i = 0; i < num_trees; ++i)
+    for (int i = 0; i < forest.size(); ++i)
     {
-        // specify tree model path
-        sprintf(tree_index, "tree_%02d.yml", i);
-        fs::path tree_path = model_path / tree_index;
-
-        assert(fs::exists(tree_path));
-        cerr << "loading " << tree_path << endl;
+        assert(fs::exists(tree_paths[i]));
 
         rf::tree tree;
-        tree.load(tree_path.string());
+        tree.load(tree_paths[i].string());
         forest[i] = std::move(tree);
     }
 
-    assert(forest.size() == num_trees);
+    cerr << "loaded " << forest.size() << " trees" << endl;
 
+    float mean_error = 0;
 
     // iterate through test data
     for (int i = 0; i < data.size(); ++i)
@@ -182,41 +231,131 @@ testing(const fs::path& dataset_path, const fs::path& model_path, const int& num
 
         assert(votes.size() == forest.size());
 
-        // mean-shift to find mode of probability density function
-        for (int iter = 0; iter < max_ms_iter; ++iter)
-        {
-            cv::Vec3f temp_mean = 0;
-            float sum_weight = 0.f;
-
-            // compute weighted mean
-            for (int k = 0; k < votes.size(); ++k)
-            {
-                // compute gaussian kernel
-                float norm = (float)cv::norm(mean, votes[k]);
-                float weight = 1.0 / exp(pow(norm, 2.0) / (2.0 * bandwidth));
-                sum_weight += weight;
-
-                // weighted mean
-                temp_mean += weight * votes[k];
-            }
-
-            // normalize weighted mean
-            temp_mean /= (float)MAX(1, sum_weight);
-
-            // compute distance to previous mean
-            float distance_to_previous_mean = (float)cv::norm(temp_mean, mean);
-
-            // update mean
-            mean = temp_mean;
-
-            // check converge to stop
-            if (distance_to_previous_mean < 0.05)
-                break;
-        }
+        // mean shift to find weighted mean / mode
+        meanshift(votes, mean);
 
         // final prediction
         cout << mean << endl;
+
+        // calculate mean error
+        mean_error += (float)cv::norm(data[i].label, mean);
     }
+
+    mean_error /= (float)data.size();
+    cout << "-----------------" << endl;
+    cout << "mean error : " << mean_error << endl;
+}
+
+
+/*
+ * program leave-one-out validation
+ * param[in]: dataset path and model path
+ *
+ */
+void
+crossval(const fs::path& dataset_path, const fs::path& model_path, const int& num_trees)
+{
+    const int max_img_idx = 23;
+
+    // load full dataset
+    std::vector<rf::sample> data;
+    load_dataset(dataset_path, data);
+
+    float mean_cv_error = 0;
+
+    // iterate through image test index
+    for (int i = 1; i <= max_img_idx; ++i)
+    {
+        std::vector<rf::sample> train_set, test_set;
+
+        // collecting data
+        // testing image index == i
+        // the rest images are used for training
+        for (int j = 0; j < data.size(); ++j)
+        {
+            if (data[j].img_index == i)
+            {
+                test_set.push_back(data[j]);
+            }
+            else
+            {
+                train_set.push_back(data[j]);
+            }
+        }
+
+        char folder_index[128];
+        sprintf(folder_index, "cv_%02d", i);
+
+        // check output folder
+        // if not exiss create it
+        fs::path out_dir = model_path / folder_index;
+        if (!fs::exists(out_dir))
+            fs::create_directory(out_dir);
+
+        char tree_index[128];
+        std::vector<rf::tree> forest(num_trees);
+
+        // training forest
+        for (int t = 0; t < num_trees; ++t)
+        {
+            // create tree path
+            sprintf(tree_index, "tree_%02d.yml", t);
+            fs::path tree_path = out_dir / tree_index;
+
+            // sampling with replacement
+            std::vector<rf::sample> samples;
+            sampling_with_replacement(train_set, samples);
+
+            // construct tree
+            cerr << "training " << tree_path << endl;
+            rf::tree tree;
+            tree.grow(samples);
+
+            // save tree
+            tree.save(tree_path.string());
+            assert(fs::exists(tree_path));
+
+            // add tree to forest
+            forest[t] = std::move(tree);
+        }
+
+        float mean_error = 0;
+
+        // testing forest
+        for (int j = 0; j < test_set.size(); ++j)
+        {
+            cv::Vec3f mean = 0;
+            cv::Vec3f prediction = 0;
+            int count = 0;
+
+            // send data to the trees for prediction
+            std::vector<cv::Vec3f> votes;
+            for (int j = 0; j < forest.size(); ++j)
+            {
+                rf::leaf_vote vote = forest[j].predict(test_set[j]);
+                votes.push_back(vote.mean);
+
+                mean += vote.mean;
+                count++;
+            }
+            mean /= (float)MAX(1, count);
+
+            // mean shift to find weighted mean / mode
+            // mean is the final prediction
+            meanshift(votes, mean);
+
+            // calculate error
+            mean_error += (float)cv::norm(test_set[j].label, mean);
+        }
+
+        // mean error at this evaluation
+        mean_error /= (float)test_set.size();
+        mean_cv_error += mean_error;
+        cout << mean_error << endl;
+    }
+
+    mean_cv_error /= (float)max_img_idx;
+    cout << "mean cross validation error : " << mean_cv_error << endl;
 }
 
 
@@ -262,7 +401,11 @@ main(int argc, char *argv[])
             break;
         case 1:
             clog << "program testing" << endl;
-            testing(dataset_path, model_path, 10);
+            testing(dataset_path, model_path);
+            break;
+        case 2:
+            clog << "program leave-one-out evaluation" << endl;
+            crossval(dataset_path, model_path, 1);
             break;
         default:
             cout << "error mode input" << endl;;
